@@ -55,6 +55,9 @@ use futures::ready;
 use futures::stream::{Stream, StreamExt};
 use log::debug;
 
+use crate::stream::ReservationStream;
+use crate::spill::get_record_batch_memory_size;
+
 #[derive(Debug, Clone)]
 /// This object tracks the aggregation phase (input/output)
 pub(crate) enum ExecutionState {
@@ -1134,31 +1137,33 @@ impl GroupedHashAggregateStream {
         // clear up memory for streaming_merge
         self.clear_all();
         self.update_memory_reservation()?;
-        let mut streams: Vec<SendableRecordBatchStream> = vec![];
-        let expr = self.spill_state.spill_expr.clone();
         let schema = batch.schema();
 
         // If we're doing a merge sort, all the spilled streams will have batch_size sized batches
         // We should strive to do that as well here, so following operators get batches with consistent sizes.
         // This does wonders for memory resilience in our case.
-        let lexsort_metrics = self.lexsort_metrics.clone();
-        let batch_size = self.batch_size;
-        streams.push(Box::pin(RecordBatchStreamAdapter::new(
+        let sorted_batches =
+            sort_batch_chunked(&batch, &self.spill_state.spill_expr, self.batch_size, &self.lexsort_metrics)?;
+        drop(batch);
+
+        let total_sorted_size: usize = sorted_batches
+            .iter()
+            .map(get_record_batch_memory_size)
+            .sum();
+
+        let mut reservation = self.reservation.new_empty();
+        reservation.try_grow(total_sorted_size)?;
+
+        // Wrap in ReservationStream to hold the reservation and shrink it on each consumed batch
+        let stream = Box::pin(ReservationStream::new(
             Arc::clone(&schema),
-            futures::stream::once(futures::future::lazy(move |_| {
-                sort_batch_chunked(&batch, &expr, batch_size, &lexsort_metrics)
-            }))
-            .flat_map(|result| {
-                futures::stream::iter(match result {
-                    Ok(batches) => batches.into_iter().map(Ok).collect(),
-                    Err(e) => vec![Err(e)],
-                })
-            }),
-        )));
+            Box::pin(RecordBatchStreamAdapter::new(Arc::clone(&schema), futures::stream::iter(sorted_batches.into_iter().map(Ok)))),
+            reservation,
+        ));
 
         self.spill_state.is_stream_merging = true;
         self.input = StreamingMergeBuilder::new()
-            .with_streams(streams)
+            .with_streams(vec![stream])
             .with_schema(schema)
             .with_spill_manager(self.spill_state.spill_manager.clone())
             .with_sorted_spill_files(mem::take(&mut self.spill_state.spills))

@@ -724,13 +724,9 @@ impl ExternalSorter {
         );
 
         let schema = batch.schema();
-        let lexsort_metrics = self.metrics.lexsort_metrics.clone();
-        let expressions = self.expr.clone();
-        let batch_size = self.batch_size;
-
         // Sort the batch immediately and get all output batches
         let sorted_batches =
-            sort_batch_chunked(&batch, &expressions, batch_size, &lexsort_metrics)?;
+            sort_batch_chunked(&batch, &self.expr, self.batch_size, &self.metrics.lexsort_metrics)?;
         drop(batch);
 
         // Free the old reservation and grow it to match the actual sorted output size
@@ -739,11 +735,7 @@ impl ExternalSorter {
             .iter()
             .map(get_record_batch_memory_size)
             .sum();
-        reservation.try_grow(total_sorted_size).map_err(|e| {
-            DataFusionError::ResourcesExhausted(format!(
-                "Failed to reserve memory for sorted batches: {e}"
-            ))
-        })?;
+        reservation.try_grow(total_sorted_size)?;
 
         // Create a stream that yields the sorted batches and records metrics
         let batch_stream =
