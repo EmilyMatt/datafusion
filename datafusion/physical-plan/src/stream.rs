@@ -41,6 +41,9 @@ use pin_project_lite::pin_project;
 use tokio::runtime::Handle;
 use tokio::sync::mpsc::{Receiver, Sender};
 
+use crate::spill::get_record_batch_memory_size;
+use datafusion_execution::memory_pool::MemoryReservation;
+
 /// Creates a stream from a collection of producing tasks, routing panics to the stream.
 ///
 /// Note that this is similar to  [`ReceiverStream` from tokio-stream], with the differences being:
@@ -694,6 +697,73 @@ impl Stream for BatchSplitStream {
 }
 
 impl RecordBatchStream for BatchSplitStream {
+    fn schema(&self) -> SchemaRef {
+        Arc::clone(&self.schema)
+    }
+}
+
+/// A stream that holds a memory reservation for its lifetime,
+/// shrinking the reservation as batches are consumed.
+/// The original reservation must have its batch sizes calculated using [`get_record_batch_memory_size`]
+pub struct ReservationStream {
+    schema: SchemaRef,
+    inner: SendableRecordBatchStream,
+    reservation: MemoryReservation,
+}
+
+impl ReservationStream {
+    pub fn new(
+        schema: SchemaRef,
+        inner: SendableRecordBatchStream,
+        reservation: MemoryReservation,
+    ) -> Self {
+        Self {
+            schema,
+            inner,
+            reservation,
+        }
+    }
+}
+
+impl Stream for ReservationStream {
+    type Item = Result<RecordBatch>;
+
+    fn poll_next(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Self::Item>> {
+        let res = self.inner.poll_next_unpin(cx);
+
+        match res {
+            Poll::Ready(res) => {
+                match res {
+                    Some(Ok(batch)) => {
+                        self.reservation
+                            .shrink(get_record_batch_memory_size(&batch));
+                        Poll::Ready(Some(Ok(batch)))
+                    }
+                    Some(Err(err)) => {
+                        // Had an error so drop the data
+                        self.reservation.free();
+                        Poll::Ready(Some(Err(err)))
+                    }
+                    None => {
+                        // Stream is done so free the memory
+                        self.reservation.free();
+                        Poll::Ready(None)
+                    }
+                }
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.inner.size_hint()
+    }
+}
+
+impl RecordBatchStream for ReservationStream {
     fn schema(&self) -> SchemaRef {
         Arc::clone(&self.schema)
     }

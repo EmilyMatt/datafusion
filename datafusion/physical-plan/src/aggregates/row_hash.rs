@@ -19,7 +19,7 @@
 
 use std::sync::Arc;
 use std::task::{Context, Poll};
-use std::vec;
+use std::{mem, vec};
 
 use super::order::GroupOrdering;
 use super::AggregateExec;
@@ -30,7 +30,8 @@ use crate::aggregates::{
     PhysicalGroupBy,
 };
 use crate::metrics::{BaselineMetrics, MetricBuilder, RecordOutput};
-use crate::sorts::sort::sort_batch;
+use crate::sorts::metrics::LexSortMetrics;
+use crate::sorts::sort::{sort_batch, sort_batch_chunked};
 use crate::sorts::streaming_merge::{SortedSpillFile, StreamingMergeBuilder};
 use crate::spill::spill_manager::SpillManager;
 use crate::stream::RecordBatchStreamAdapter;
@@ -436,6 +437,9 @@ pub(crate) struct GroupedHashAggregateStream {
 
     /// Reduction factor metric, calculated as `output_rows/input_rows` (only for partial aggregation)
     reduction_factor: Option<metrics::RatioMetrics>,
+
+    /// Metrics for the spill manager's lexsort
+    lexsort_metrics: LexSortMetrics,
 }
 
 impl GroupedHashAggregateStream {
@@ -454,6 +458,7 @@ impl GroupedHashAggregateStream {
         let input = agg.input.execute(partition, Arc::clone(&context))?;
         let baseline_metrics = BaselineMetrics::new(&agg.metrics, partition);
         let group_by_metrics = GroupByMetrics::new(&agg.metrics, partition);
+        let lexsort_metrics = LexSortMetrics::new(&agg.metrics, partition);
 
         let timer = baseline_metrics.elapsed_compute().timer();
 
@@ -627,6 +632,7 @@ impl GroupedHashAggregateStream {
             exec_state,
             baseline_metrics,
             group_by_metrics,
+            lexsort_metrics,
             batch_size,
             group_ordering,
             input_done: false,
@@ -1052,9 +1058,16 @@ impl GroupedHashAggregateStream {
         let Some(emit) = self.emit(EmitTo::All, true)? else {
             return Ok(());
         };
-        let sorted = sort_batch(&emit, &self.spill_state.spill_expr, None)?;
+        let sorted = sort_batch(
+            &emit,
+            &self.spill_state.spill_expr,
+            None,
+            &self.lexsort_metrics,
+        )?;
 
         // Spill sorted state to disk
+        // Spilling will split the batches to self.batch_size size using slice,
+        // so we can lose the (small as it may be) overhead of using sort_batch_chunked
         let spillfile = self
             .spill_state
             .spill_manager
@@ -1124,11 +1137,23 @@ impl GroupedHashAggregateStream {
         let mut streams: Vec<SendableRecordBatchStream> = vec![];
         let expr = self.spill_state.spill_expr.clone();
         let schema = batch.schema();
+
+        // If we're doing a merge sort, all the spilled streams will have batch_size sized batches
+        // We should strive to do that as well here, so following operators get batches with consistent sizes.
+        // This does wonders for memory resilience in our case.
+        let lexsort_metrics = self.lexsort_metrics.clone();
+        let batch_size = self.batch_size;
         streams.push(Box::pin(RecordBatchStreamAdapter::new(
             Arc::clone(&schema),
             futures::stream::once(futures::future::lazy(move |_| {
-                sort_batch(&batch, &expr, None)
-            })),
+                sort_batch_chunked(&batch, &expr, batch_size, &lexsort_metrics)
+            }))
+            .flat_map(|result| {
+                futures::stream::iter(match result {
+                    Ok(batches) => batches.into_iter().map(Ok).collect(),
+                    Err(e) => vec![Err(e)],
+                })
+            }),
         )));
 
         self.spill_state.is_stream_merging = true;
@@ -1136,7 +1161,7 @@ impl GroupedHashAggregateStream {
             .with_streams(streams)
             .with_schema(schema)
             .with_spill_manager(self.spill_state.spill_manager.clone())
-            .with_sorted_spill_files(std::mem::take(&mut self.spill_state.spills))
+            .with_sorted_spill_files(mem::take(&mut self.spill_state.spills))
             .with_expressions(&self.spill_state.spill_expr)
             .with_metrics(self.baseline_metrics.clone())
             .with_batch_size(self.batch_size)

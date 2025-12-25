@@ -34,14 +34,13 @@ use crate::filter_pushdown::{
 };
 use crate::limit::LimitStream;
 use crate::metrics::{
-    BaselineMetrics, ExecutionPlanMetricsSet, MetricsSet, SpillMetrics, SplitMetrics,
+    BaselineMetrics, ExecutionPlanMetricsSet, MetricsSet, SpillMetrics,
 };
 use crate::projection::{make_with_child, update_ordering, ProjectionExec};
 use crate::sorts::streaming_merge::{SortedSpillFile, StreamingMergeBuilder};
 use crate::spill::get_record_batch_memory_size;
 use crate::spill::in_progress_spill_file::InProgressSpillFile;
 use crate::spill::spill_manager::{GetSlicedSize, SpillManager};
-use crate::stream::BatchSplitStream;
 use crate::stream::RecordBatchStreamAdapter;
 use crate::topk::TopK;
 use crate::topk::TopKDynamicFilters;
@@ -69,13 +68,17 @@ use datafusion_physical_expr::PhysicalExpr;
 use futures::{StreamExt, TryStreamExt};
 use log::{debug, trace};
 
+use arrow::util::bit_util::round_upto_multiple_of_64;
+use crate::sorts::metrics::LexSortMetrics;
+use crate::stream::ReservationStream;
+
 struct ExternalSorterMetrics {
     /// metrics
     baseline: BaselineMetrics,
 
     spill_metrics: SpillMetrics,
 
-    split_metrics: SplitMetrics,
+    lexsort_metrics: LexSortMetrics,
 }
 
 impl ExternalSorterMetrics {
@@ -83,7 +86,7 @@ impl ExternalSorterMetrics {
         Self {
             baseline: BaselineMetrics::new(metrics, partition),
             spill_metrics: SpillMetrics::new(metrics, partition),
-            split_metrics: SplitMetrics::new(metrics, partition),
+            lexsort_metrics: LexSortMetrics::new(metrics, partition),
         }
     }
 }
@@ -545,7 +548,7 @@ impl ExternalSorter {
 
         while let Some(batch) = sorted_stream.next().await {
             let batch = batch?;
-            let sorted_size = get_reserved_byte_for_record_batch(&batch);
+            let sorted_size = get_reserved_byte_for_record_batch(&batch)?;
             if self.reservation.try_grow(sorted_size).is_err() {
                 // Although the reservation is not enough, the batch is
                 // already in memory, so it's okay to combine it with previously
@@ -663,7 +666,7 @@ impl ExternalSorter {
         if self.in_mem_batches.len() == 1 {
             let batch = self.in_mem_batches.swap_remove(0);
             let reservation = self.reservation.take();
-            return self.sort_batch_stream(batch, metrics, reservation, true);
+            return self.sort_batch_stream(batch, metrics, reservation);
         }
 
         // If less than sort_in_place_threshold_bytes, concatenate and sort in place
@@ -672,10 +675,10 @@ impl ExternalSorter {
             let batch = concat_batches(&self.schema, &self.in_mem_batches)?;
             self.in_mem_batches.clear();
             self.reservation
-                .try_resize(get_reserved_byte_for_record_batch(&batch))
+                .try_resize(get_reserved_byte_for_record_batch(&batch)?)
                 .map_err(Self::err_with_oom_context)?;
             let reservation = self.reservation.take();
-            return self.sort_batch_stream(batch, metrics, reservation, true);
+            return self.sort_batch_stream(batch, metrics, reservation);
         }
 
         let streams = std::mem::take(&mut self.in_mem_batches)
@@ -684,15 +687,8 @@ impl ExternalSorter {
                 let metrics = self.metrics.baseline.intermediate();
                 let reservation = self
                     .reservation
-                    .split(get_reserved_byte_for_record_batch(&batch));
-                let input = self.sort_batch_stream(
-                    batch,
-                    metrics,
-                    reservation,
-                    // Passing false as `StreamingMergeBuilder` will split the
-                    // stream into batches of `self.batch_size` rows.
-                    false,
-                )?;
+                    .split(get_reserved_byte_for_record_batch(&batch)?);
+                let input = self.sort_batch_stream(batch, metrics, reservation)?;
                 Ok(spawn_buffered(input, 1))
             })
             .collect::<Result<_>>()?;
@@ -720,42 +716,48 @@ impl ExternalSorter {
         &self,
         batch: RecordBatch,
         metrics: BaselineMetrics,
-        reservation: MemoryReservation,
-        mut split: bool,
+        mut reservation: MemoryReservation,
     ) -> Result<SendableRecordBatchStream> {
         assert_eq!(
-            get_reserved_byte_for_record_batch(&batch),
+            get_reserved_byte_for_record_batch(&batch)?,
             reservation.size()
         );
 
-        split = split && batch.num_rows() > self.batch_size;
-
         let schema = batch.schema();
-
+        let lexsort_metrics = self.metrics.lexsort_metrics.clone();
         let expressions = self.expr.clone();
-        let stream = futures::stream::once(async move {
-            let _timer = metrics.elapsed_compute().timer();
+        let batch_size = self.batch_size;
 
-            let sorted = sort_batch(&batch, &expressions, None)?;
+        // Sort the batch immediately and get all output batches
+        let sorted_batches =
+            sort_batch_chunked(&batch, &expressions, batch_size, &lexsort_metrics)?;
+        drop(batch);
 
-            metrics.record_output(sorted.num_rows());
-            drop(batch);
-            drop(reservation);
-            Ok(sorted)
-        });
+        // Free the old reservation and grow it to match the actual sorted output size
+        reservation.free();
+        let total_sorted_size: usize = sorted_batches
+            .iter()
+            .map(get_record_batch_memory_size)
+            .sum();
+        reservation.try_grow(total_sorted_size).map_err(|e| {
+            DataFusionError::ResourcesExhausted(format!(
+                "Failed to reserve memory for sorted batches: {e}"
+            ))
+        })?;
 
-        let mut output: SendableRecordBatchStream =
-            Box::pin(RecordBatchStreamAdapter::new(schema, stream));
+        // Create a stream that yields the sorted batches and records metrics
+        let batch_stream =
+            futures::stream::iter(sorted_batches.into_iter().map(move |batch| {
+                metrics.record_output(batch.num_rows());
+                Ok(batch)
+            }));
 
-        if split {
-            output = Box::pin(BatchSplitStream::new(
-                output,
-                self.batch_size,
-                self.metrics.split_metrics.clone(),
-            ));
-        }
-
-        Ok(output)
+        // Wrap in ReservationStream to hold the reservation and shrink it on each consumed batch
+        Ok(Box::pin(ReservationStream::new(
+            Arc::clone(&schema),
+            Box::pin(RecordBatchStreamAdapter::new(schema, batch_stream)),
+            reservation,
+        )))
     }
 
     /// If this sort may spill, pre-allocates
@@ -781,7 +783,7 @@ impl ExternalSorter {
         &mut self,
         input: &RecordBatch,
     ) -> Result<()> {
-        let size = get_reserved_byte_for_record_batch(input);
+        let size = get_reserved_byte_for_record_batch(input)?;
 
         match self.reservation.try_grow(size) {
             Ok(_) => Ok(()),
@@ -814,22 +816,14 @@ impl ExternalSorter {
 }
 
 /// Estimate how much memory is needed to sort a `RecordBatch`.
-///
-/// This is used to pre-reserve memory for the sort/merge. The sort/merge process involves
-/// creating sorted copies of sorted columns in record batches for speeding up comparison
-/// in sorting and merging. The sorted copies are in either row format or array format.
-/// Please refer to cursor.rs and stream.rs for more details. No matter what format the
-/// sorted copies are, they will use more memory than the original record batch.
-pub(crate) fn get_reserved_byte_for_record_batch_size(record_batch_size: usize) -> usize {
-    // 2x may not be enough for some cases, but it's a good start.
-    // If 2x is not enough, user can set a larger value for `sort_spill_reservation_bytes`
-    // to compensate for the extra memory needed.
-    record_batch_size * 2
-}
-
-/// Estimate how much memory is needed to sort a `RecordBatch`.
-fn get_reserved_byte_for_record_batch(batch: &RecordBatch) -> usize {
-    get_reserved_byte_for_record_batch_size(get_record_batch_memory_size(batch))
+/// This is calculated by adding the record batch's memory size
+/// (which can be much larger than expected for sliced record batches)
+/// with the sliced buffer sizes, as that is the amount that will be needed to create the new buffer.
+/// The latter is rounded up to the nearest multiple of 64 based on the architecture,
+/// as this is how arrow creates buffers.
+pub(super) fn get_reserved_byte_for_record_batch(batch: &RecordBatch) -> Result<usize> {
+    Ok(get_record_batch_memory_size(batch)
+        + round_upto_multiple_of_64(batch.get_sliced_size()?))
 }
 
 impl Debug for ExternalSorter {
@@ -847,22 +841,24 @@ pub fn sort_batch(
     batch: &RecordBatch,
     expressions: &LexOrdering,
     fetch: Option<usize>,
+    metrics: &LexSortMetrics,
 ) -> Result<RecordBatch> {
-    let sort_columns = expressions
-        .iter()
-        .map(|expr| expr.evaluate_to_sort_column(batch))
-        .collect::<Result<Vec<_>>>()?;
+    let sort_columns = {
+        let _timer = metrics.time_evaluating_sort_columns.timer();
+        expressions
+            .iter()
+            .map(|expr| expr.evaluate_to_sort_column(batch))
+            .collect::<Result<Vec<_>>>()?
+    };
 
-    let indices = lexsort_to_indices(&sort_columns, fetch)?;
-    let mut columns = take_arrays(batch.columns(), &indices, None)?;
-
-    // The columns may be larger than the unsorted columns in `batch` especially for variable length
-    // data types due to exponential growth when building the sort columns. We shrink the columns
-    // to prevent memory reservation failures, as well as excessive memory allocation when running
-    // merges in `SortPreservingMergeStream`.
-    columns.iter_mut().for_each(|c| {
-        c.shrink_to_fit();
-    });
+    let indices = {
+        let _timer = metrics.time_calculating_lexsort_indices.timer();
+        lexsort_to_indices(&sort_columns, fetch)?
+    };
+    let columns = {
+        let _timer = metrics.time_taking_indices_in_lexsort.timer();
+        take_arrays(batch.columns(), &indices, None)?
+    };
 
     let options = RecordBatchOptions::new().with_row_count(Some(indices.len()));
     Ok(RecordBatch::try_new_with_options(
@@ -870,6 +866,57 @@ pub fn sort_batch(
         columns,
         &options,
     )?)
+}
+
+/// Sort a batch and return the result as multiple batches of size `batch_size`.
+/// This is useful when you want to avoid creating one large sorted batch in memory,
+/// and instead want to process the sorted data in smaller chunks.
+pub fn sort_batch_chunked(
+    batch: &RecordBatch,
+    expressions: &LexOrdering,
+    batch_size: usize,
+    metrics: &LexSortMetrics,
+) -> Result<Vec<RecordBatch>> {
+    let sort_columns = {
+        let _timer = metrics.time_evaluating_sort_columns.timer();
+        expressions
+            .iter()
+            .map(|expr| expr.evaluate_to_sort_column(batch))
+            .collect::<Result<Vec<_>>>()?
+    };
+
+    let indices = {
+        let _timer = metrics.time_calculating_lexsort_indices.timer();
+        lexsort_to_indices(&sort_columns, None)?
+    };
+
+    // Split indices into chunks of batch_size
+    let num_rows = indices.len();
+    let num_chunks = num_rows.div_ceil(batch_size);
+
+    let _timer = metrics.time_taking_indices_in_lexsort.timer();
+
+    let result_batches = (0..num_chunks)
+        .map(|chunk_idx| {
+            let start = chunk_idx * batch_size;
+            let end = (start + batch_size).min(num_rows);
+            let chunk_len = end - start;
+
+            // Create a slice of indices for this chunk
+            let chunk_indices = indices.slice(start, chunk_len);
+
+            // Take the columns using this chunk of indices
+            let columns = take_arrays(batch.columns(), &chunk_indices, None)?;
+
+            let options = RecordBatchOptions::new().with_row_count(Some(chunk_len));
+            let chunk_batch =
+                RecordBatch::try_new_with_options(batch.schema(), columns, &options)?;
+
+            Ok(chunk_batch)
+        })
+        .collect::<Result<Vec<RecordBatch>>>()?;
+
+    Ok(result_batches)
 }
 
 /// Sort execution plan.
@@ -1635,7 +1682,7 @@ mod tests {
         {
             let mut stream = plan.execute(0, Arc::clone(&task_ctx))?;
             let first_batch = stream.next().await.unwrap()?;
-            let batch_reservation = get_reserved_byte_for_record_batch(&first_batch);
+            let batch_reservation = get_reserved_byte_for_record_batch(&first_batch)?;
 
             assert_eq!(batch_reservation, expected_batch_reservation);
             assert!(memory_limit < (merge_reservation + batch_reservation));
@@ -2085,7 +2132,9 @@ mod tests {
         }]
         .into();
 
-        let result = sort_batch(&batch, &expressions, None).unwrap();
+        let exec_plan_metrics_set = ExecutionPlanMetricsSet::default();
+        let metrics = LexSortMetrics::new(&exec_plan_metrics_set, 0);
+        let result = sort_batch(&batch, &expressions, None, &metrics).unwrap();
         assert_eq!(result.num_rows(), 1);
     }
 
@@ -2381,7 +2430,10 @@ mod tests {
         // assert output
         {
             let input_batches_concat = concat_batches(batches[0].schema_ref(), &batches)?;
-            let sorted_input_batch = sort_batch(&input_batches_concat, &ordering, None)?;
+            let exec_plan_metrics_set = ExecutionPlanMetricsSet::default();
+            let metrics = LexSortMetrics::new(&exec_plan_metrics_set, 0);
+            let sorted_input_batch =
+                sort_batch(&input_batches_concat, &ordering, None, &metrics)?;
 
             let sorted_batches_concat =
                 concat_batches(sorted_batches[0].schema_ref(), &sorted_batches)?;

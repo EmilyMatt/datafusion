@@ -75,6 +75,8 @@ use datafusion_physical_expr::LexOrdering;
 use futures::{ready, Stream, StreamExt};
 use log::trace;
 
+use crate::sorts::metrics::LexSortMetrics;
+
 /// Partial Sort execution plan.
 #[derive(Debug, Clone)]
 pub struct PartialSortExec {
@@ -309,6 +311,7 @@ impl ExecutionPlan for PartialSortExec {
             fetch: self.fetch,
             is_closed: false,
             baseline_metrics: BaselineMetrics::new(&self.metrics_set, partition),
+            lexsort_metrics: LexSortMetrics::new(&self.metrics_set, partition),
         }))
     }
 
@@ -341,6 +344,8 @@ struct PartialSortStream {
     is_closed: bool,
     /// Execution metrics
     baseline_metrics: BaselineMetrics,
+    /// Specific metrics for the sort.
+    lexsort_metrics: LexSortMetrics,
 }
 
 impl Stream for PartialSortStream {
@@ -398,7 +403,12 @@ impl PartialSortStream {
                             slice_point,
                             self.in_mem_batch.num_rows() - slice_point,
                         );
-                        let sorted_batch = sort_batch(&sorted, &self.expr, self.fetch)?;
+                        let sorted_batch = sort_batch(
+                            &sorted,
+                            &self.expr,
+                            self.fetch,
+                            &self.lexsort_metrics,
+                        )?;
                         if let Some(fetch) = self.fetch.as_mut() {
                             *fetch -= sorted_batch.num_rows();
                         }
@@ -430,7 +440,8 @@ impl PartialSortStream {
     fn sort_in_mem_batch(self: &mut Pin<&mut Self>) -> Result<RecordBatch> {
         let input_batch = self.in_mem_batch.clone();
         self.in_mem_batch = RecordBatch::new_empty(self.schema());
-        let result = sort_batch(&input_batch, &self.expr, self.fetch)?;
+        let result =
+            sort_batch(&input_batch, &self.expr, self.fetch, &self.lexsort_metrics)?;
         if let Some(remaining_fetch) = self.fetch {
             // remaining_fetch - result.num_rows() is always be >= 0
             // because result length of sort_batch with limit cannot be
